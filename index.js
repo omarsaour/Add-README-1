@@ -4,6 +4,7 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -66,7 +67,30 @@ function emptyDb() {
   };
 }
 
+
+let supabase = null;
+let cloudState = null;
+let cloudWriteQueue = Promise.resolve();
+let cloudWriteError = null;
+
+function normalizeDb(db) {
+  return {
+    ...emptyDb(),
+    ...(db || {}),
+    users: db?.users || [],
+    sessions: db?.sessions || [],
+    subscriptions: db?.subscriptions || [],
+    creator_subscriptions: db?.creator_subscriptions || [],
+    coin_transactions: db?.coin_transactions || [],
+    creator_coin_transactions: db?.creator_coin_transactions || [],
+    daily_rewards: db?.daily_rewards || [],
+    publish_requests: db?.publish_requests || []
+  };
+}
+
 function loadDb() {
+  if (cloudState) return cloudState.db;
+
   if (!fs.existsSync(DB_FILE)) {
     const db = emptyDb();
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
@@ -74,19 +98,7 @@ function loadDb() {
   }
 
   try {
-    const db = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-    return {
-      ...emptyDb(),
-      ...db,
-      users: db.users || [],
-      sessions: db.sessions || [],
-      subscriptions: db.subscriptions || [],
-      creator_subscriptions: db.creator_subscriptions || [],
-      coin_transactions: db.coin_transactions || [],
-      creator_coin_transactions: db.creator_coin_transactions || [],
-      daily_rewards: db.daily_rewards || [],
-      publish_requests: db.publish_requests || []
-    };
+    return normalizeDb(JSON.parse(fs.readFileSync(DB_FILE, "utf8")));
   } catch {
     throw new Error("db.json is invalid");
   }
@@ -96,9 +108,16 @@ function saveDb(db) {
   const tmp = DB_FILE + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(db, null, 2), "utf8");
   fs.renameSync(tmp, DB_FILE);
+
+  if (cloudState) {
+    cloudState.db = db;
+    persistCloudState();
+  }
 }
 
 function loadApps() {
+  if (cloudState) return cloudState.apps;
+
   if (!fs.existsSync(APPS_FILE)) {
     fs.writeFileSync(APPS_FILE, "[]", "utf8");
   }
@@ -114,6 +133,114 @@ function saveApps(apps) {
   const tmp = APPS_FILE + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(apps, null, 2), "utf8");
   fs.renameSync(tmp, APPS_FILE);
+
+  if (cloudState) {
+    cloudState.apps = apps;
+    persistCloudState();
+  }
+}
+
+function persistCloudState() {
+  if (!supabase || !cloudState) return Promise.resolve();
+
+  const snapshot = JSON.parse(JSON.stringify(cloudState));
+
+  cloudWriteQueue = cloudWriteQueue.catch(() => {}).then(async () => {
+    const { error } = await supabase
+      .from("omar_store_state")
+      .upsert({
+        id: 1,
+        state: snapshot,
+        updated_at: now()
+      });
+
+    if (error) {
+      cloudWriteError = error;
+      console.error("Supabase save failed:", error.message);
+      throw error;
+    }
+
+    cloudWriteError = null;
+  });
+
+  return cloudWriteQueue;
+}
+
+async function initializeSupabaseState() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SECRET_KEY;
+
+  if (!url || !key) {
+    throw new Error(
+      "SUPABASE_URL or SUPABASE_SECRET_KEY is missing"
+    );
+  }
+
+  supabase = createClient(url, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false
+    }
+  });
+
+  const { data, error } = await supabase
+    .from("omar_store_state")
+    .select("state")
+    .eq("id", 1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error("Supabase read failed: " + error.message);
+  }
+
+  const saved = data?.state;
+
+  if (saved && saved.db && Array.isArray(saved.db.users)) {
+    cloudState = {
+      db: normalizeDb(saved.db),
+      apps: Array.isArray(saved.apps) ? saved.apps : []
+    };
+
+    console.log("Loaded Omar Store state from Supabase.");
+  } else {
+    // First migration: preserve the local data if it exists.
+    const localDb = normalizeDb(loadDb());
+    const localApps = loadApps();
+
+    cloudState = {
+      db: localDb,
+      apps: localApps
+    };
+
+    const { error: migrationError } = await supabase
+      .from("omar_store_state")
+      .upsert({
+        id: 1,
+        state: cloudState,
+        updated_at: now()
+      });
+
+    if (migrationError) {
+      throw new Error(
+        "Initial Supabase migration failed: " +
+        migrationError.message
+      );
+    }
+
+    console.log("Initial local state saved to Supabase.");
+  }
+
+  // Keep local JSON as a fallback copy, not the cloud source of truth.
+  fs.writeFileSync(
+    DB_FILE,
+    JSON.stringify(cloudState.db, null, 2),
+    "utf8"
+  );
+  fs.writeFileSync(
+    APPS_FILE,
+    JSON.stringify(cloudState.apps, null, 2),
+    "utf8"
+  );
 }
 
 function cleanUser(user) {
@@ -312,7 +439,6 @@ function ensureAdmin() {
   };
 }
 
-const adminSetup = ensureAdmin();
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -349,6 +475,45 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: "2mb" }));
+
+
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+
+  res.json = function(body) {
+    if (!supabase || !cloudState) {
+      return originalJson(body);
+    }
+
+    return cloudWriteQueue.then(() => {
+      if (cloudWriteError) {
+        console.error(
+          "Database write failed; response withheld:",
+          cloudWriteError.message
+        );
+
+        return res.status(503)
+          .type("application/json")
+          .end(JSON.stringify({
+            success: false,
+            error: "database_write_failed"
+          }));
+      }
+
+      return originalJson(body);
+    }).catch(() => {
+      return res.status(503)
+        .type("application/json")
+        .end(JSON.stringify({
+          success: false,
+          error: "database_write_failed"
+        }));
+    });
+  };
+
+  next();
+});
+
 
 /* =========================================================
    BASIC
@@ -1456,126 +1621,344 @@ app.get(
 );
 
 /* =========================================================
-   PUBLISH REQUESTS
+   PUBLISH REQUESTS - CENTRAL SERVER
 ========================================================= */
+
+function publishUploadMiddleware(req, res, next) {
+  upload.fields([
+    { name: "apk", maxCount: 1 },
+    { name: "icon", maxCount: 1 },
+    { name: "screenshots", maxCount: 10 }
+  ])(req, res, err => {
+    if (err) {
+      return res.status(400).json({
+        success: false,
+        error: err.message
+      });
+    }
+    next();
+  });
+}
+
+function removePublishUploads(files) {
+  for (const group of Object.values(files || {})) {
+    for (const file of group || []) {
+      try { fs.unlinkSync(file.path); } catch {}
+    }
+  }
+}
 
 app.post(
   "/api/publish-requests",
   requireAuth,
+  publishUploadMiddleware,
   (req, res) => {
+    const files = req.files || {};
     try {
-      const db = req.auth.db;
+      const db = loadDb();
+      const user = getUserById(db, req.auth.user.id);
+      if (!user) {
+        removePublishUploads(files);
+        return res.status(401).json({
+          success: false, error: "user_not_found"
+        });
+      }
 
-      const type = normalizeText(
-        req.body.type,
-        20
+      const type = normalizeText(req.body.type, 20);
+      const clientRequestId = normalizeText(
+        req.body.client_request_id, 120
       );
 
-      if (type !== "publish" && type !== "update") {
-        return res.status(400).json({
-          success: false,
-          error: "invalid_request_type"
-        });
-      }
-
-      const appId =
-        req.body.app_id == null
-          ? null
-          : Number(req.body.app_id);
-
-      if (
-        type === "publish" &&
-        appId !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: "publish_cannot_have_app_id"
-        });
-      }
-
-      if (type === "update") {
-        const apps = loadApps();
-
-        if (
-          !appId ||
-          !apps.some(
-            a => Number(a.id) === appId
-          )
-        ) {
-          return res.status(400).json({
-            success: false,
-            error: "app_not_found"
+      if (clientRequestId) {
+        const previous = db.publish_requests.find(r =>
+          Number(r.user_id) === Number(user.id) &&
+          r.client_request_id === clientRequestId
+        );
+        if (previous) {
+          removePublishUploads(files);
+          return res.status(200).json({
+            success: true,
+            duplicate: true,
+            request: previous
           });
         }
       }
 
+      if (type !== "publish" && type !== "update") {
+        removePublishUploads(files);
+        return res.status(400).json({
+          success: false, error: "invalid_request_type"
+        });
+      }
+
+      if (!files.apk || !files.apk[0]) {
+        removePublishUploads(files);
+        return res.status(400).json({
+          success: false, error: "apk_required"
+        });
+      }
+
+      const appId = req.body.app_id == null || req.body.app_id === ""
+        ? null : Number(req.body.app_id);
+
+      const apps = loadApps();
+      let oldApp = null;
+
+      if (type === "publish") {
+        if (appId !== null) {
+          removePublishUploads(files);
+          return res.status(400).json({
+            success: false, error: "publish_cannot_have_app_id"
+          });
+        }
+      } else {
+        oldApp = apps.find(a => Number(a.id) === appId);
+        if (!appId || !oldApp) {
+          removePublishUploads(files);
+          return res.status(400).json({
+            success: false, error: "app_not_found"
+          });
+        }
+      }
+
+      const packageName = normalizeText(
+        req.body.package_name || oldApp?.package_name, 200
+      );
+      const name = normalizeText(
+        req.body.name || oldApp?.name, 200
+      );
+
+      if (!packageName || !name) {
+        removePublishUploads(files);
+        return res.status(400).json({
+          success: false, error: "name_and_package_name_required"
+        });
+      }
+
+      if (type === "publish" && apps.some(a =>
+        String(a.package_name).toLowerCase() === packageName.toLowerCase()
+      )) {
+        removePublishUploads(files);
+        return res.status(409).json({
+          success: false, error: "package_name_exists"
+        });
+      }
+
+      const before = Number(user.creator_coins || 0);
+      const fee = 500;
+      if (before < fee) {
+        removePublishUploads(files);
+        return res.status(400).json({
+          success: false,
+          error: "insufficient_creator_coins",
+          balance: before,
+          required: fee
+        });
+      }
+
+      const baseUrl = (
+        process.env.PUBLIC_BASE_URL ||
+        `${req.protocol}://${req.get("host")}`
+      ).replace(/\/+$/, "");
+
       const request = {
         id: db.nextRequestId++,
-        user_id: req.auth.user.id,
+        client_request_id: clientRequestId || null,
+        user_id: user.id,
+        username: user.username,
+        email: user.email,
         type,
         app_id: appId,
-        package_name: normalizeText(
-          req.body.package_name,
-          200
+        package_name: packageName,
+        name,
+        version_name: normalizeText(req.body.version_name, 100),
+        version_code: Math.max(1, Number(req.body.version_code) || 1),
+        category: normalizeText(req.body.category, 100),
+        description: normalizeText(req.body.description, 10000),
+        whats_new: normalizeText(req.body.whats_new || req.body.changelog, 5000),
+        apk_url: `${baseUrl}/uploads/apks/${files.apk[0].filename}`,
+        apk_filename: files.apk[0].filename,
+        icon_url: files.icon?.[0]
+          ? `${baseUrl}/uploads/icons/${files.icon[0].filename}` : null,
+        screenshots: (files.screenshots || []).map(
+          f => `${baseUrl}/uploads/screenshots/${f.filename}`
         ),
-        name: normalizeText(
-          req.body.name,
-          200
-        ),
+        fee,
         status: "pending",
         created_at: now(),
         updated_at: now()
       };
 
+      user.creator_coins = before - fee;
+      db.creator_coin_transactions.push({
+        id: randomToken(12),
+        user_id: user.id,
+        type: "publish_request_fee",
+        amount: -fee,
+        before,
+        after: user.creator_coins,
+        description: `رسوم طلب نشر: ${name}`,
+        request_id: request.id,
+        created_at: now()
+      });
+
       db.publish_requests.push(request);
       saveDb(db);
 
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
-        request
+        request,
+        creator_coins: user.creator_coins
       });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error: error.message
+      console.error("publish request error:", error);
+      return res.status(500).json({
+        success: false, error: "publish_request_failed"
       });
     }
   }
 );
 
-app.get(
-  "/api/publish-requests",
-  requireAuth,
-  (req, res) => {
-    const db = req.auth.db;
+app.get("/api/publish-requests", requireAuth, (req, res) => {
+  const db = loadDb();
+  res.json({
+    success: true,
+    requests: db.publish_requests.filter(r =>
+      Number(r.user_id) === Number(req.auth.user.id)
+    )
+  });
+});
 
-    res.json({
-      success: true,
-      requests: db.publish_requests.filter(
-        r =>
-          Number(r.user_id) ===
-          Number(req.auth.user.id)
-      )
-    });
-  }
-);
+app.get("/api/admin/publish-requests", requireAdmin, (req, res) => {
+  const db = loadDb();
+  res.json({ success: true, requests: db.publish_requests });
+});
 
-app.get(
-  "/api/admin/publish-requests",
+app.post(
+  "/api/admin/publish-requests/:id/review",
   requireAdmin,
   (req, res) => {
-    const db = req.auth.db;
+    try {
+      const db = loadDb();
+      const request = db.publish_requests.find(
+        r => Number(r.id) === Number(req.params.id)
+      );
 
-    res.json({
-      success: true,
-      requests: db.publish_requests
-    });
+      if (!request) {
+        return res.status(404).json({
+          success: false, error: "request_not_found"
+        });
+      }
+
+      if (request.status !== "pending") {
+        return res.status(409).json({
+          success: false,
+          error: "request_already_reviewed",
+          request
+        });
+      }
+
+      const action = normalizeText(req.body.action, 30).toLowerCase();
+      const reason = normalizeText(req.body.reason, 1000);
+
+      if (["reject", "rejected"].includes(action)) {
+        request.status = "rejected";
+        request.review_reason = reason;
+        request.reviewed_by = req.auth.user.id;
+        request.updated_at = now();
+        saveDb(db);
+        return res.json({ success: true, request });
+      }
+
+      if (!["approve", "accept", "approved"].includes(action)) {
+        return res.status(400).json({
+          success: false, error: "invalid_review_action"
+        });
+      }
+
+      if (!request.apk_url) {
+        return res.status(400).json({
+          success: false, error: "request_apk_missing"
+        });
+      }
+
+      const apps = loadApps();
+      let index = -1;
+
+      if (request.type === "update") {
+        index = apps.findIndex(a =>
+          Number(a.id) === Number(request.app_id)
+        );
+        if (index < 0) {
+          return res.status(404).json({
+            success: false, error: "app_not_found"
+          });
+        }
+      } else {
+        index = apps.findIndex(a =>
+          String(a.package_name).toLowerCase() ===
+          String(request.package_name).toLowerCase()
+        );
+        if (index >= 0) {
+          return res.status(409).json({
+            success: false, error: "package_name_exists"
+          });
+        }
+      }
+
+      const oldApp = index >= 0 ? apps[index] : null;
+      const appData = {
+        id: oldApp?.id ?? (
+          apps.length ? Math.max(...apps.map(a => Number(a.id) || 0)) + 1 : 1
+        ),
+        name: request.name,
+        package_name: request.package_name,
+        description: request.description || "",
+        category: request.category || "",
+        version_name: request.version_name || "",
+        version_code: Math.max(1, Number(request.version_code) || 1),
+        changelog: request.whats_new || "",
+        size_mb: 0,
+        icon_url: request.icon_url || oldApp?.icon_url || null,
+        apk_url: request.apk_url,
+        screenshots: request.screenshots || [],
+        downloads: Number(oldApp?.downloads || 0),
+        status: "published",
+        created_at: oldApp?.created_at || now(),
+        updated_at: now()
+      };
+
+      if (oldApp && appData.version_code < Number(oldApp.version_code || 0)) {
+        return res.status(400).json({
+          success: false, error: "version_downgrade_not_allowed"
+        });
+      }
+
+      if (index >= 0) apps[index] = appData;
+      else apps.push(appData);
+
+      saveApps(apps);
+
+      request.status = "approved";
+      request.reviewed_by = req.auth.user.id;
+      request.review_reason = reason;
+      request.published_app_id = appData.id;
+      request.updated_at = now();
+      saveDb(db);
+
+      return res.json({
+        success: true,
+        request,
+        app: appData
+      });
+    } catch (error) {
+      console.error("publish review error:", error);
+      return res.status(500).json({
+        success: false, error: "publish_review_failed"
+      });
+    }
   }
 );
-
-/* =========================================================
-   STATIC FILES
-========================================================= */
 
 app.use(
   "/uploads",
@@ -1599,7 +1982,11 @@ app.use((err, req, res, next) => {
    START
 ========================================================= */
 
-app.listen(PORT, "0.0.0.0", () => {
+async function startServer() {
+  await initializeSupabaseState();
+  const adminSetup = ensureAdmin();
+  await persistCloudState();
+  app.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================================");
   console.log("        OMAR BACKEND 2.0");
@@ -1614,11 +2001,17 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log("⚠️ INITIAL ADMIN ACCOUNT");
     console.log("Username: ADMIN");
     console.log("Email: admin@omarstore.local");
-    console.log("Password: [hidden]");
+    console.log("Password: " + adminSetup.password);
     console.log("");
     console.log("احفظ كلمة السر فوراً.");
     console.log("==============================================");
   }
 
   console.log("");
+});
+}
+
+startServer().catch(error => {
+  console.error("OmarBackend startup failed:", error.message);
+  process.exitCode = 1;
 });
